@@ -4,16 +4,19 @@ Setup a factory-reset Mi Smart LED Bulb Essential.
 Steps:
   1. Factory reset the bulb (toggle power 5 times quickly)
   2. Connect your PC to the bulb's WiFi AP (e.g. "yeelink-light-xxxxx")
-  3. Run this script — it discovers the bulb, grabs the token,
-     and optionally enables Yeelight LAN/developer mode
-  4. Enter your home WiFi credentials
-  5. The bulb joins your home WiFi with the same token
+  3. Run this script — it discovers the bulb and grabs the token
+  4. Check for paired BLE remote rules, if supported by the bulb, and repeatedly
+     offer to remove one remote at a time until Enter is pressed (miIO.bleEvtRuleDel,
+     the command the Mi Home plugin uses; verified by re-reading the table)
+  5. Optionally enable Yeelight LAN/developer mode
+  6. Enter your home WiFi credentials; the bulb joins with the same token
 
 Usage:
     python setup_bulb.py
 """
 
 import json
+import re
 import socket
 import struct
 import sys
@@ -27,6 +30,7 @@ except ImportError:
     print("python-miio not installed. Run: pip install python-miio")
     sys.exit(1)
 
+CONFIG_PATH = Path(__file__).parent / "bulb_config.json"
 
 def discover(timeout=5):
     """Send miio handshake to known AP-mode IPs and broadcast."""
@@ -117,6 +121,117 @@ def enable_developer_mode(ip: str, token: str):
         return None
 
 
+def real_mac(reverse_mac: str) -> str:
+    """Convert a dump MAC (reversed byte order) to the normal colon form."""
+    hex_digits = re.sub(r"[^0-9a-fA-F]", "", reverse_mac)
+    pairs = [hex_digits[i:i + 2] for i in range(0, len(hex_digits), 2)]
+    return ":".join(reversed(pairs)).upper()
+
+
+def read_paired_ble_remotes(device: Device):
+    """Return paired BLE remote rules, or None if they cannot be read."""
+    try:
+        remotes = device.send(
+            "ble_dbg_tbl_dump", {"table": "evtRuleTbl"}, retry_count=1
+        )
+    except DeviceException as e:
+        print(f"Could not read paired BLE remotes: {e}")
+        print("This light may not support the BLE diagnostic command.\n")
+        return None
+
+    if not isinstance(remotes, list) or any(
+        not isinstance(remote, dict) or not isinstance(remote.get("mac"), str)
+        for remote in remotes
+    ):
+        print("Unexpected BLE diagnostic response; cannot determine paired remotes.\n")
+        return None
+
+    return remotes
+
+
+def describe_remote(remote: dict) -> str:
+    details = [f"MAC: {real_mac(remote['mac'])}"]
+    for key, label in (("pid", "product ID"), ("evtid", "event ID")):
+        if isinstance(remote.get(key), int):
+            details.append(f"{label}: {remote[key]}")
+    return ", ".join(details)
+
+
+def print_paired_ble_remotes(remotes: list):
+    """Display paired BLE remote rules (never shows beacon keys)."""
+    if not remotes:
+        print("No paired BLE remote rules reported.\n")
+        return
+
+    print(f"Found {len(remotes)} paired BLE remote rule(s):")
+    for i, remote in enumerate(remotes, 1):
+        print(f"  [{i}] {describe_remote(remote)}")
+    print("This is not a scan of all Bluetooth devices; beacon keys are not shown.\n")
+
+
+def _remote_key(remote: dict):
+    return (remote["mac"].lower(), remote.get("evtid"), remote.get("pid"))
+
+
+def delete_remote(device: Device, target: dict, remotes: list):
+    """Delete one evtRuleTbl entry and verify by re-reading the table.
+
+    Returns the table after the attempt, or None if it cannot be re-read.
+    """
+    params = {"mac": real_mac(target["mac"]), "pid": target.get("pid"), "eid": target.get("evtid")}
+    try:
+        result = device.send("miIO.bleEvtRuleDel", params, retry_count=1)
+    except DeviceException as e:
+        print(f"  Rejected by the light: {e}\n")
+        return remotes
+
+    for _ in range(3):
+        time.sleep(1)
+        after = read_paired_ble_remotes(device)
+        if after is None or _remote_key(target) not in {_remote_key(r) for r in after}:
+            break
+    if after is None:
+        print(f"  Light answered {result}, but the table could not be re-read.")
+        return None
+
+    after_keys = {_remote_key(r) for r in after}
+    if _remote_key(target) in after_keys:
+        print(f"  Light answered {result}, but the remote is still listed.")
+        print("  Unbind it in the Mi Home/Yeelight app (Remote Control > long-press > Unbind).")
+    else:
+        print("  Removed.")
+    for r in remotes:
+        if _remote_key(r) != _remote_key(target) and _remote_key(r) not in after_keys:
+            print(f"  WARNING: also disappeared: {describe_remote(r)}")
+    print()
+    return after
+
+
+def manage_ble_remotes(ip: str, token: str):
+    """List paired BLE remotes and remove them one at a time until Enter is pressed."""
+    print("Checking paired BLE remote rules via miio...")
+    device = Device(ip, token, timeout=5)
+    remotes = read_paired_ble_remotes(device)
+    if remotes is None:
+        return
+    print_paired_ble_remotes(remotes)
+    while remotes:
+        choice = input("Remove a remote? Enter its number or press Enter to continue: ").strip()
+        if not choice:
+            print()
+            return
+        if not choice.isdigit() or not 1 <= int(choice) <= len(remotes):
+            print(f"Invalid selection; enter a number from 1 to {len(remotes)}.\n")
+            continue
+        target = remotes[int(choice) - 1]
+        print(f"Removing {describe_remote(target)} ...")
+        remotes = delete_remote(device, target, remotes)
+        if remotes is None:
+            print("Stopping remote removal.\n")
+            return
+        print_paired_ble_remotes(remotes)
+
+
 def main():
     print("=== Mi Smart LED Bulb Setup ===\n")
     print("Prerequisites:")
@@ -159,6 +274,8 @@ def main():
     ip = dev["ip"]
     print(f"Got token: {token}\n")
 
+    manage_ble_remotes(ip, token)
+
     enable_lan = input("Enable Yeelight LAN/developer mode? [y/N]: ")
     if enable_lan.strip().lower() in ("y", "yes"):
         print("Enabling Yeelight LAN/developer mode...")
@@ -189,8 +306,7 @@ def main():
             "token": token,
             "mode": "miio",
         }
-        config_path = Path(__file__).parent / "bulb_config.json"
-        with open(config_path, "w") as f:
+        with open(CONFIG_PATH, "w") as f:
             json.dump(config, f, indent=2)
 
         print(f"Token saved to bulb_config.json")
@@ -209,8 +325,7 @@ def main():
             "mode": "miio",
             "ip": ip,
         }
-        config_path = Path(__file__).parent / "bulb_config.json"
-        with open(config_path, "w") as f:
+        with open(CONFIG_PATH, "w") as f:
             json.dump(config, f, indent=2)
         print(f"\nWiFi config failed but token is saved: {token}")
         print("You can re-add the bulb to Mi Home — the token may change though.")
